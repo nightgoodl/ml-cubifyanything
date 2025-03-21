@@ -1,0 +1,9 @@
+cyclonedds
+rerun-sdk
+scipy
+tifffile
+timm
+torch
+torchvision
+webdataset==0.2.86
+Pillow
