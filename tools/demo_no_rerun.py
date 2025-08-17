@@ -11,7 +11,9 @@ import torch
 import torchvision
 import sys
 import uuid
+import time
 from datetime import datetime
+from collections import defaultdict
 try:
     import open3d as o3d
     OPEN3D_AVAILABLE = True
@@ -34,6 +36,103 @@ from cubifyanything.dataset import CubifyAnythingDataset
 from cubifyanything.instances import Instances3D
 from cubifyanything.preprocessor import Augmentor, Preprocessor
 
+class TimingStats:
+    """耗时统计类"""
+    def __init__(self):
+        self.timing_data = defaultdict(list)
+        self.step_times = {}
+        self.frame_times = []
+        self.start_time = None
+    
+    def start_timer(self, step_name):
+        """开始计时"""
+        self.step_times[step_name] = time.time()
+    
+    def end_timer(self, step_name):
+        """结束计时并记录"""
+        if step_name in self.step_times:
+            elapsed = time.time() - self.step_times[step_name]
+            self.timing_data[step_name].append(elapsed)
+            del self.step_times[step_name]
+            return elapsed
+        return 0
+    
+    def start_total_timer(self):
+        """开始总计时"""
+        self.start_time = time.time()
+    
+    def end_total_timer(self):
+        """结束总计时"""
+        if self.start_time is not None:
+            total_time = time.time() - self.start_time
+            self.timing_data['total_processing'].append(total_time)
+            return total_time
+        return 0
+    
+    def add_frame_time(self, frame_time):
+        """添加单帧处理时间"""
+        self.frame_times.append(frame_time)
+    
+    def get_stats(self, step_name):
+        """获取某个步骤的统计信息"""
+        times = self.timing_data[step_name]
+        if not times:
+            return {'count': 0, 'total': 0, 'avg': 0, 'min': 0, 'max': 0}
+        return {
+            'count': len(times),
+            'total': sum(times),
+            'avg': sum(times) / len(times),
+            'min': min(times),
+            'max': max(times)
+        }
+    
+    def print_summary(self):
+        """打印耗时统计汇总"""
+        print("\n" + "="*80)
+        print("⏱️  耗时统计汇总报告")
+        print("="*80)
+        
+        # 计算总时间
+        total_stats = self.get_stats('total_processing')
+        if total_stats['count'] > 0:
+            print(f"🕒 总处理时间: {total_stats['total']:.2f}秒")
+        
+        if self.frame_times:
+            print(f"📊 处理帧数: {len(self.frame_times)}")
+            print(f"⚡ 平均每帧时间: {sum(self.frame_times)/len(self.frame_times):.3f}秒")
+            print(f"🚀 最快帧: {min(self.frame_times):.3f}秒")
+            print(f"🐌 最慢帧: {max(self.frame_times):.3f}秒")
+            print(f"⚡ 平均FPS: {len(self.frame_times)/sum(self.frame_times):.2f}")
+        
+        print("\n📋 各步骤耗时详情:")
+        print("-" * 80)
+        
+        # 按总耗时排序显示各步骤
+        step_totals = []
+        for step_name in self.timing_data:
+            if step_name != 'total_processing':
+                stats = self.get_stats(step_name)
+                if stats['count'] > 0:
+                    step_totals.append((step_name, stats))
+        
+        step_totals.sort(key=lambda x: x[1]['total'], reverse=True)
+        
+        for step_name, stats in step_totals:
+            total_time = stats['total']
+            avg_time = stats['avg']
+            count = stats['count']
+            min_time = stats['min']
+            max_time = stats['max']
+            
+            print(f"{step_name:30} | "
+                  f"总计: {total_time:7.2f}s | "
+                  f"次数: {count:4d} | "
+                  f"平均: {avg_time:6.3f}s | "
+                  f"最小: {min_time:6.3f}s | "
+                  f"最大: {max_time:6.3f}s")
+        
+        print("="*80)
+
 def move_device_like(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
     try:
         return src.to(dst)
@@ -51,6 +150,10 @@ def move_input_to_current_device(batched_input: Sensors, t: torch.Tensor):
 def process_data_and_save_outputs(model, dataset, augmentor, preprocessor, score_thresh=0.0, viz_on_gt_points=False, output_dir="outputs"):
     """处理数据并保存NOCS图和点云"""
     print(f"📁 开始处理数据，输出目录: {output_dir}")
+    
+    # 初始化耗时统计
+    timing_stats = TimingStats()
+    timing_stats.start_total_timer()
 
     os.makedirs(output_dir, exist_ok=True)
     nocs_dir = os.path.join(output_dir, "nocs_images")
@@ -69,6 +172,7 @@ def process_data_and_save_outputs(model, dataset, augmentor, preprocessor, score
     video_id = None
     
     for sample in dataset:
+        frame_start_time = time.time()
         frame_count += 1
         video_id = sample["meta"]["video_id"]
 
@@ -77,15 +181,26 @@ def process_data_and_save_outputs(model, dataset, augmentor, preprocessor, score
         elif frame_count % 10 == 0:
             print(f"📊 Processing frame {frame_count}...")
 
+        # 数据加载和预处理
+        timing_stats.start_timer('data_loading')
         image = np.moveaxis(sample["wide"]["image"][-1].numpy(), 0, -1)        
+        timing_stats.end_timer('data_loading')
 
+        # 数据打包和设备转移
+        timing_stats.start_timer('data_packaging')
         packaged = augmentor.package(sample)
         packaged = move_input_to_current_device(packaged, device)
         packaged = preprocessor.preprocess([packaged])
+        timing_stats.end_timer('data_packaging')
 
+        # 模型推理
+        timing_stats.start_timer('model_inference')
         with torch.no_grad():
             pred_instances = model(packaged)[0]
+        timing_stats.end_timer('model_inference')
 
+        # 预测结果过滤
+        timing_stats.start_timer('prediction_filtering')
         pred_instances = pred_instances[pred_instances.scores >= score_thresh]
         
         if len(pred_instances) > 0:
@@ -97,8 +212,11 @@ def process_data_and_save_outputs(model, dataset, augmentor, preprocessor, score
                 'scores': pred_instances.scores.cpu().numpy(),
                 'frame': frame_count
             })
+        timing_stats.end_timer('prediction_filtering')
         
         if viz_on_gt_points and sample["sensor_info"].has("gt"):
+            # 深度图反投影
+            timing_stats.start_timer('depth_unprojection')
             depth_gt = sample["gt"]["depth"][-1]
             matched_image = torch.tensor(np.array(Image.fromarray(image).resize((depth_gt.shape[1], depth_gt.shape[0]))))
 
@@ -112,92 +230,105 @@ def process_data_and_save_outputs(model, dataset, augmentor, preprocessor, score
             
             xyzrgb = torch.cat((xyz, matched_image / 255.0), dim=-1)[valid]
             pixel_coords_valid = pixel_coords[valid]
+            timing_stats.end_timer('depth_unprojection')
             
             if len(xyzrgb) > 0:
                 print(f"💡 处理当前帧点云: {len(xyzrgb):,} 个点")
                 
-                # 只收集点云用于归一化处理，不保存
+                # 点云数据收集
+                timing_stats.start_timer('pointcloud_collection')
                 all_pointclouds.append({
                     'points': xyzrgb[..., :3].cpu().numpy(),
                     'colors': xyzrgb[..., 3:].cpu().numpy(),
                     'frame': frame_count
                 })
+                timing_stats.end_timer('pointcloud_collection')
                 
-                if "wide" in sample and "instances" in sample["wide"]:
-                    if "world_instances_3d" in sample and sample["world_instances_3d"] is not None:
-                        world_gt_instances = sample["world_instances_3d"]
-                        print(f"Using world coordinate GT instances: {len(world_gt_instances)} instances")
-                        
-                    elif "world" in sample and "instances" in sample["world"]:
-                        world_gt_instances = sample["world"]["instances"]
-                        print(f"Using world coordinate GT instances from sample['world']: {len(world_gt_instances)} instances")
-                        
-                    else:
-                        if "wide" in sample and "instances" in sample["wide"]:
-                            gt_instances = sample["wide"]["instances"]
-                            world_gt_instances = gt_instances.clone()
-                            
-                            if world_gt_instances.has("gt_boxes_3d"):
-                                original_boxes = world_gt_instances.get("gt_boxes_3d")
-                                
-                                RT_np = RT_camera_to_world.numpy()
-                                
-                                centers = original_boxes.gravity_center.cpu().numpy()
-                                centers_homogeneous = np.concatenate([centers, np.ones((centers.shape[0], 1))], axis=1)
-                                transformed_centers = (RT_np @ centers_homogeneous.T).T[:, :3]
-                                
-                                transformed_R = RT_np[:3, :3] @ original_boxes.R.cpu().numpy()
-                                transformed_boxes = GeneralInstance3DBoxes(
-                                    np.concatenate([transformed_centers, original_boxes.dims.cpu().numpy()], axis=1),
-                                    transformed_R
-                                )
-                                
-                                world_gt_instances.set("gt_boxes_3d", transformed_boxes)
-                                print(f"Transformed camera coordinate instances to world: {len(world_gt_instances)} instances")
-                            else:
-                                print("Warning: No gt_boxes_3d found in instances")
-                        else:
-                            print("Warning: No GT instances available for NOCS generation")
-
-                    # 生成并保存当前帧所有物体的NOCS图
-                    nocs_image = generate_instance_nocs_map(
-                        xyzrgb[..., :3].cpu().numpy(),  # (N, 3) 格式
-                        world_gt_instances,  # 使用变换到世界坐标系的instances
-                        sample["sensor_info"].wide.image.K[-1].numpy(),  # 保留兼容性，但不使用
-                        RT_camera_to_world.numpy(),  # 保留兼容性，但不使用
-                        depth_gt.shape[-2:],  # 使用depth图尺寸
-                        pixel_coords=pixel_coords_valid.cpu().numpy()  # 传入像素坐标对应关系 (N, 2)
-                    )
-                    if nocs_image is not None:
-                        # 保存NOCS图为图像文件
-                        nocs_image_pil = Image.fromarray(nocs_image)
-                        nocs_file = os.path.join(nocs_dir, f"frame_{frame_count:04d}_nocs.png")
-                        nocs_image_pil.save(nocs_file)
-                        print(f"💾 保存NOCS图: {nocs_file}")
+                # GT实例处理
+                timing_stats.start_timer('gt_instance_processing')
+                if "world_instances_3d" in sample and sample["world_instances_3d"] is not None:
+                    world_gt_instances = sample["world_instances_3d"]
+                    print(f"Using world coordinate GT instances: {len(world_gt_instances)} instances")
                     
-                    # 注释掉分割点云保存，只保留必要的文件夹
-                    # save_segmented_pointclouds(
-                    #     xyzrgb[..., :3].cpu().numpy(),
-                    #     xyzrgb[..., 3:].cpu().numpy(),
-                    #     world_gt_instances,
-                    #     frame_count,
-                    #     pointcloud_dir
-                    # )
+                elif "world" in sample and "instances" in sample["world"]:
+                    world_gt_instances = sample["world"]["instances"]
+                    print(f"Using world coordinate GT instances from sample['world']: {len(world_gt_instances)} instances")
+                    
+                else:
+                    if "wide" in sample and "instances" in sample["wide"]:
+                        gt_instances = sample["wide"]["instances"]
+                        world_gt_instances = gt_instances.clone()
+                        
+                        if world_gt_instances.has("gt_boxes_3d"):
+                            original_boxes = world_gt_instances.get("gt_boxes_3d")
+                            
+                            RT_np = RT_camera_to_world.numpy()
+                            
+                            centers = original_boxes.gravity_center.cpu().numpy()
+                            centers_homogeneous = np.concatenate([centers, np.ones((centers.shape[0], 1))], axis=1)
+                            transformed_centers = (RT_np @ centers_homogeneous.T).T[:, :3]
+                            
+                            transformed_R = RT_np[:3, :3] @ original_boxes.R.cpu().numpy()
+                            transformed_boxes = GeneralInstance3DBoxes(
+                                np.concatenate([transformed_centers, original_boxes.dims.cpu().numpy()], axis=1),
+                                transformed_R
+                            )
+                            
+                            world_gt_instances.set("gt_boxes_3d", transformed_boxes)
+                            print(f"Transformed camera coordinate instances to world: {len(world_gt_instances)} instances")
+                        else:
+                            print("Warning: No gt_boxes_3d found in instances")
+                    else:
+                        print("Warning: No GT instances available for NOCS generation")
+                timing_stats.end_timer('gt_instance_processing')
 
-                    # 新增：按instance ID收集点云用于累积
-                    collect_instance_pointclouds(
-                        xyzrgb[..., :3].cpu().numpy(),
-                        xyzrgb[..., 3:].cpu().numpy(),
-                        world_gt_instances,
-                        frame_count,
-                        instance_pointclouds
-                    )
+                # NOCS生成
+                timing_stats.start_timer('nocs_generation')
+                nocs_image = generate_instance_nocs_map(
+                    xyzrgb[..., :3].cpu().numpy(),  # (N, 3) 格式
+                    world_gt_instances,  # 使用变换到世界坐标系的instances
+                    sample["sensor_info"].wide.image.K[-1].numpy(),  # 保留兼容性，但不使用
+                    RT_camera_to_world.numpy(),  # 保留兼容性，但不使用
+                    depth_gt.shape[-2:],  # 使用depth图尺寸
+                    pixel_coords=pixel_coords_valid.cpu().numpy()  # 传入像素坐标对应关系 (N, 2)
+                )
+                timing_stats.end_timer('nocs_generation')
+                
+                # NOCS图像保存
+                if nocs_image is not None:
+                    timing_stats.start_timer('nocs_image_saving')
+                    nocs_image_pil = Image.fromarray(nocs_image)
+                    nocs_file = os.path.join(nocs_dir, f"frame_{frame_count:04d}_nocs.png")
+                    nocs_image_pil.save(nocs_file)
+                    print(f"💾 保存NOCS图: {nocs_file}")
+                    timing_stats.end_timer('nocs_image_saving')
+                
+                # 实例点云收集
+                timing_stats.start_timer('instance_pointcloud_collection')
+                collect_instance_pointclouds(
+                    xyzrgb[..., :3].cpu().numpy(),
+                    xyzrgb[..., 3:].cpu().numpy(),
+                    world_gt_instances,
+                    frame_count,
+                    instance_pointclouds
+                )
+                timing_stats.end_timer('instance_pointcloud_collection')
 
-    # 处理完所有帧后，保存累积的结果
+        # 记录单帧处理时间
+        frame_time = time.time() - frame_start_time
+        timing_stats.add_frame_time(frame_time)
+        
+        # 每10帧输出一次耗时统计
+        if frame_count % 10 == 0:
+            avg_frame_time = sum(timing_stats.frame_times[-10:]) / min(10, len(timing_stats.frame_times))
+            print(f"⏱️ 最近10帧平均处理时间: {avg_frame_time:.3f}秒")
+
+    # 累积结果保存
     print(f"📊 完成数据处理，正在保存累积结果...")
     
-    # 保存累积的预测框信息
+    # 预测框信息保存
     if all_pred_boxes:
+        timing_stats.start_timer('prediction_saving')
         accumulated_predictions_file = os.path.join(accumulated_dir, "all_predictions.txt")
         with open(accumulated_predictions_file, 'w') as f:
             f.write("Frame\tNumBoxes\tCenters\tSizes\tScores\n")
@@ -223,45 +354,21 @@ def process_data_and_save_outputs(model, dataset, augmentor, preprocessor, score
         save_pointcloud_ply(all_centers, colors, accumulated_predictions_ply)
         print(f"💾 保存累积预测框为点云: {accumulated_predictions_ply}")
         print(f"💡 累积预测: {len(all_centers)} 个检测结果")
+        timing_stats.end_timer('prediction_saving')
     
-    # 注释掉累积场景点云的合并和保存，暂时不需要全场景点云
-    # if all_pointclouds:
-    #     print(f"📊 合并并保存累积场景点云...")
-    #     accumulated_points = np.concatenate([pc['points'] for pc in all_pointclouds], axis=0)
-    #     accumulated_colors = np.concatenate([pc['colors'] for pc in all_pointclouds], axis=0)
-    # 
-    #     accumulated_pointcloud_file = os.path.join(accumulated_dir, "accumulated_scene_pointcloud.ply")
-    #     save_pointcloud_ply(accumulated_points, accumulated_colors, accumulated_pointcloud_file)
-    #     print(f"💾 保存累积场景点云: {accumulated_pointcloud_file}")
-    #     print(f"💡 累积点云: {len(accumulated_points):,} 个点")
     print("🚀 跳过全场景累积点云处理（专注于物体级处理）")
-    # ⭐ 修改：保存每个instance的累积点云（适应新数据结构）
+    
+    # 归一化实例点云保存
     if instance_pointclouds:
-        '''
-        print(f"📊 保存每个instance的累积点云...")
-        for instance_id, instance_data in instance_pointclouds.items():
-            if instance_data and 'pointcloud_frames' in instance_data:
-                pointcloud_frames = instance_data['pointcloud_frames']
-                if pointcloud_frames:  # 确保该instance有点云数据
-                    # 合并该instance在所有帧中的点云
-                    instance_points = np.concatenate([frame['points'] for frame in pointcloud_frames], axis=0)
-                    instance_colors = np.concatenate([frame['colors'] for frame in pointcloud_frames], axis=0)
-
-                    # 保存该instance的累积点云
-                    instance_file = os.path.join(instance_accumulated_dir, f"instance_{instance_id}_accumulated.ply")
-                    save_pointcloud_ply(instance_points, instance_colors, instance_file)
-                    print(f"💾 保存instance {instance_id}累积点云: {instance_file}")
-                    print(f"💡 Instance {instance_id}: {len(instance_points):,} 个点，来自 {len(pointcloud_frames)} 帧")
-
-        print(f"✅ 总共保存了 {len(instance_pointclouds)} 个instance的累积点云")
-        
-        # 新增：保存归一化的instance点云
-        '''
-        # 使用默认体素下采样设置
+        timing_stats.start_timer('normalized_pointcloud_saving')
         save_normalized_instance_pointclouds(instance_pointclouds, output_dir)
+        timing_stats.end_timer('normalized_pointcloud_saving')
+    
+    # 结束总计时
+    total_time = timing_stats.end_total_timer()
     
     # 数据处理完成后的提示
-    print(f"\n✅ 数据处理完成！总共处理了 {frame_count} 帧")
+    print(f"\n✅ 数据处理完成！总共处理了 {frame_count} 帧，耗时 {total_time:.2f}秒")
     print(f"📁 输出目录: {output_dir}")
     print(f"  📸 NOCS图: {nocs_dir}")
     print(f"  📊 累积结果: {accumulated_dir}")
@@ -271,10 +378,17 @@ def process_data_and_save_outputs(model, dataset, augmentor, preprocessor, score
         print(f"🔴 累积预测: {total_predictions} 个检测结果")
     if instance_pointclouds:
         print(f"🎯 Instance累积: {len(instance_pointclouds)} 个不同的object")
+    
+    # 打印详细耗时统计
+    timing_stats.print_summary()
 
 def process_data_visualization_only(dataset, output_dir="outputs_viz"):
     """仅可视化数据，保存NOCS图和点云"""
     print(f"📁 开始数据可视化，输出目录: {output_dir}")
+    
+    # 初始化耗时统计
+    timing_stats = TimingStats()
+    timing_stats.start_total_timer()
 
     os.makedirs(output_dir, exist_ok=True)
     nocs_dir = os.path.join(output_dir, "nocs_images")
@@ -288,6 +402,7 @@ def process_data_visualization_only(dataset, output_dir="outputs_viz"):
     instance_pointclouds = {}
     
     for sample in dataset:
+        frame_start_time = time.time()
         frame_count += 1
 
         if frame_count == 1:
@@ -304,12 +419,15 @@ def process_data_visualization_only(dataset, output_dir="outputs_viz"):
             print("Warning: 'image' key not found in sample['wide'], skipping frame")
             continue
 
-        # -> channels last.
+        # 数据加载
+        timing_stats.start_timer('data_loading')
         image = np.moveaxis(sample["wide"]["image"][-1].numpy(), 0, -1)        
+        timing_stats.end_timer('data_loading')
 
         # 处理当前帧的点云数据并生成NOCS
         if "gt" in sample and sample["gt"] is not None and "depth" in sample["gt"]:
-            # Backproject GT depth to world so we can generate NOCS
+            # 深度图反投影
+            timing_stats.start_timer('depth_unprojection')
             depth_gt = sample["gt"]["depth"][-1]
             matched_image = torch.tensor(np.array(Image.fromarray(image).resize((depth_gt.shape[1], depth_gt.shape[0]))))
 
@@ -327,23 +445,23 @@ def process_data_visualization_only(dataset, output_dir="outputs_viz"):
             # 应用valid mask，同时保留像素坐标和点云数据
             xyzrgb = torch.cat((xyz, matched_image / 255.0), dim=-1)[valid]
             pixel_coords_valid = pixel_coords[valid]  # 对应的像素坐标 (N, 2)
+            timing_stats.end_timer('depth_unprojection')
             
             # 保存当前帧的点云
             if len(xyzrgb) > 0:
                 print(f"💡 保存当前帧点云: {len(xyzrgb):,} 个点")
                 
-                # 保存单帧点云
-                #frame_pointcloud_file = os.path.join(pointcloud_dir, f"frame_{frame_count:04d}_pointcloud.ply")
-                #save_pointcloud_ply(xyzrgb[..., :3].cpu().numpy(), xyzrgb[..., 3:].cpu().numpy(), frame_pointcloud_file)
-                
-                # 收集点云用于累积
+                # 点云数据收集
+                timing_stats.start_timer('pointcloud_collection')
                 all_pointclouds.append({
                     'points': xyzrgb[..., :3].cpu().numpy(),
                     'colors': xyzrgb[..., 3:].cpu().numpy(),
                     'frame': frame_count
                 })
+                timing_stats.end_timer('pointcloud_collection')
                 
-                # 使用GT instances生成NOCS图
+                # GT实例处理
+                timing_stats.start_timer('gt_instance_processing')
                 # 🌍 优先检查是否有世界坐标系GT instances
                 if "world_instances_3d" in sample and sample["world_instances_3d"] is not None:
                     world_gt_instances = sample["world_instances_3d"]
@@ -390,10 +508,12 @@ def process_data_visualization_only(dataset, output_dir="outputs_viz"):
                     else:
                         print("⚠️ [VIZ] 警告: 未找到任何GT instances数据")
                         world_gt_instances = None
+                timing_stats.end_timer('gt_instance_processing')
 
                 # 继续处理world_gt_instances（如果存在）
                 if world_gt_instances is not None and len(world_gt_instances) > 0:
-                    # 生成并保存当前帧所有物体的NOCS图
+                    # NOCS生成
+                    timing_stats.start_timer('nocs_generation')
                     nocs_image = generate_instance_nocs_map(
                         xyzrgb[..., :3].cpu().numpy(),  # (N, 3) 格式
                         world_gt_instances,  # 使用变换到世界坐标系的instances
@@ -402,24 +522,19 @@ def process_data_visualization_only(dataset, output_dir="outputs_viz"):
                         depth_gt.shape[-2:],  # 使用depth图尺寸而不是image尺寸
                         pixel_coords=pixel_coords_valid.cpu().numpy()  # 传入像素坐标对应关系 (N, 2)
                     )
+                    timing_stats.end_timer('nocs_generation')
+                    
+                    # NOCS图像保存
                     if nocs_image is not None:
-                        # 保存NOCS图为图像文件
+                        timing_stats.start_timer('nocs_image_saving')
                         nocs_image_pil = Image.fromarray(nocs_image)
                         nocs_file = os.path.join(nocs_dir, f"frame_{frame_count:04d}_nocs.png")
                         nocs_image_pil.save(nocs_file)
                         print(f"💾 保存NOCS图: {nocs_file}")
-                    '''  
-                    # 保存分割后的点云（每个物体单独保存）
-                    save_segmented_pointclouds(
-                        xyzrgb[..., :3].cpu().numpy(),
-                        xyzrgb[..., 3:].cpu().numpy(),
-                        world_gt_instances,
-                        frame_count,
-                        pointcloud_dir
-                    )
-                    '''
+                        timing_stats.end_timer('nocs_image_saving')
 
-                    # 新增：按instance ID收集点云用于累积
+                    # 实例点云收集
+                    timing_stats.start_timer('instance_pointcloud_collection')
                     collect_instance_pointclouds(
                         xyzrgb[..., :3].cpu().numpy(),
                         xyzrgb[..., 3:].cpu().numpy(),
@@ -427,47 +542,37 @@ def process_data_visualization_only(dataset, output_dir="outputs_viz"):
                         frame_count,
                         instance_pointclouds
                     )
+                    timing_stats.end_timer('instance_pointcloud_collection')
+        
+        # 记录单帧处理时间
+        frame_time = time.time() - frame_start_time
+        timing_stats.add_frame_time(frame_time)
+        
+        # 每10帧输出一次耗时统计
+        if frame_count % 10 == 0:
+            avg_frame_time = sum(timing_stats.frame_times[-10:]) / min(10, len(timing_stats.frame_times))
+            print(f"⏱️ 最近10帧平均处理时间: {avg_frame_time:.3f}秒")
     
-    # 注释掉累积场景点云的合并和保存，暂时不需要全场景点云
-    # if all_pointclouds:
-    #     print(f"📊 合并并保存累积场景点云...")
-    #     accumulated_points = np.concatenate([pc['points'] for pc in all_pointclouds], axis=0)
-    #     accumulated_colors = np.concatenate([pc['colors'] for pc in all_pointclouds], axis=0)
-    # 
-    #     accumulated_pointcloud_file = os.path.join(accumulated_dir, "accumulated_scene_pointcloud.ply")
-    #     save_pointcloud_ply(accumulated_points, accumulated_colors, accumulated_pointcloud_file)
-    #     print(f"💾 保存累积场景点云: {accumulated_pointcloud_file}")
-    #     print(f"💡 累积点云: {len(accumulated_points):,} 个点")
     print("🚀 跳过全场景累积点云处理（专注于物体级处理）")
 
+    # 归一化实例点云保存
     if instance_pointclouds:
-        '''
-        print(f"📊 保存每个instance的累积点云...")
-        for instance_id, instance_data in instance_pointclouds.items():
-            if instance_data and 'pointcloud_frames' in instance_data:
-                pointcloud_frames = instance_data['pointcloud_frames']
-                if pointcloud_frames:  # 确保该instance有点云数据
-                    # 合并该instance在所有帧中的点云
-                    instance_points = np.concatenate([frame['points'] for frame in pointcloud_frames], axis=0)
-                    instance_colors = np.concatenate([frame['colors'] for frame in pointcloud_frames], axis=0)
-
-                    # 保存该instance的累积点云
-                    instance_file = os.path.join(instance_accumulated_dir, f"instance_{instance_id}_accumulated.ply")
-                    save_pointcloud_ply(instance_points, instance_colors, instance_file)
-                    print(f"💾 保存instance {instance_id}累积点云: {instance_file}")
-                    print(f"💡 Instance {instance_id}: {len(instance_points):,} 个点，来自 {len(pointcloud_frames)} 帧")
-
-        print(f"✅ 总共保存了 {len(instance_pointclouds)} 个instance的累积点云")
-    '''
-        # 使用默认体素下采样设置
+        timing_stats.start_timer('normalized_pointcloud_saving')
         save_normalized_instance_pointclouds(instance_pointclouds, output_dir)
+        timing_stats.end_timer('normalized_pointcloud_saving')
+
+    # 结束总计时
+    total_time = timing_stats.end_total_timer()
 
     # 数据处理完成后的提示
-    print(f"\n✅ 数据处理完成！总共处理了 {frame_count} 帧")
+    print(f"\n✅ 数据处理完成！总共处理了 {frame_count} 帧，耗时 {total_time:.2f}秒")
     print(f"📁 输出目录: {output_dir}")
     print(f"  📸 NOCS图: {nocs_dir}")
     print(f"  📊 累积结果: {accumulated_dir}")
     print(f"  🎯 归一化Instance点云: {os.path.join(output_dir, 'normalized_instances')}")
+    
+    # 打印详细耗时统计
+    timing_stats.print_summary()
 
 def save_pointcloud_ply(points, colors, filename):
     """将点云保存为PLY文件"""
@@ -577,7 +682,7 @@ def collect_instance_pointclouds(points_3d, colors, gt_instances, frame_num, ins
             print(f"Collected {point_count} points for instance {instance_id} in frame {frame_num}")
             print(f"  Instance {instance_id} now has {len(instance_pointclouds[instance_id]['pointcloud_frames'])} frames")
 
-def downsample_pointcloud_with_open3d(points, colors, voxel_size=0.004):
+def downsample_pointcloud_with_open3d(points, colors, voxel_size=[0.004]):
     """使用Open3D进行体素下采样"""
     if not OPEN3D_AVAILABLE:
         print(f"⚠️ Open3D不可用，跳过下采样，保留原始 {len(points):,} 个点")
@@ -609,7 +714,7 @@ def downsample_pointcloud_with_open3d(points, colors, voxel_size=0.004):
         print(f"🔄 回退到原始点云: {len(points):,} 个点")
         return points, colors
 
-def save_normalized_instance_pointclouds(instance_pointclouds, output_dir, voxel_sizes=[0.004, 0.01]):
+def save_normalized_instance_pointclouds(instance_pointclouds, output_dir, voxel_sizes=[0.004]):
     """使用统一参考bbox归一化并保存instance点云，支持多级下采样"""
     normalized_dir = os.path.join(output_dir, "normalized_instances")
     os.makedirs(normalized_dir, exist_ok=True)
@@ -691,7 +796,7 @@ def save_normalized_instance_pointclouds(instance_pointclouds, output_dir, voxel
                 normalized_file = os.path.join(normalized_dir, f"instance_{instance_id}_normalized.ply")
                 save_pointcloud_ply(final_normalized_points, final_colors, normalized_file)
                 print(f"💾 保存instance {instance_id}归一化点云 (原始): {normalized_file}")
-            
+            '''
             # 保存统计信息
             stats_file = os.path.join(normalized_dir, f"instance_{instance_id}_normalized_stats.txt")
             with open(stats_file, 'w') as f:
@@ -726,6 +831,7 @@ def save_normalized_instance_pointclouds(instance_pointclouds, output_dir, voxel
                     f.write(f"    Z: [{info['normalized_range']['z'][0]:.6f}, {info['normalized_range']['z'][1]:.6f}]\n")
             
             print(f"📊 保存统计信息: {stats_file}")
+            '''
 
     if voxel_sizes:
         print(f"✅ 总共保存了 {len(instance_pointclouds)} 个instance的归一化点云（含多级下采样）")
@@ -928,7 +1034,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu", help="Which device to push the model to (cpu, mps, cuda)")
     parser.add_argument("--video-ids", nargs="+", help="Subset of videos to execute on. By default, all. Ignored if a tar file is explicitly given or in stream mode.")
     parser.add_argument("--output-dir", default=None, help="Output directory path (default: auto-generated)")
-    parser.add_argument("--voxel-sizes", nargs="+", type=float, default=[0.004, 0.01], help="体素下采样尺寸列表 (默认: 0.004 0.01)")
+    parser.add_argument("--voxel-sizes", nargs="+", type=float, default=[0.004], help="体素下采样尺寸列表 (默认: 0.004)")
     parser.add_argument("--disable-downsampling", default=False, action="store_true", help="禁用体素下采样")
 
     args = parser.parse_args()
