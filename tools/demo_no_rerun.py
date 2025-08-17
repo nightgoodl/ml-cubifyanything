@@ -12,6 +12,14 @@ import torchvision
 import sys
 import uuid
 from datetime import datetime
+try:
+    import open3d as o3d
+    OPEN3D_AVAILABLE = True
+    print("✅ Open3D可用，将使用体素下采样功能")
+except ImportError:
+    OPEN3D_AVAILABLE = False
+    print("⚠️ Open3D不可用，将跳过体素下采样")
+    o3d = None
 
 from pathlib import Path
 from PIL import Image
@@ -216,16 +224,17 @@ def process_data_and_save_outputs(model, dataset, augmentor, preprocessor, score
         print(f"💾 保存累积预测框为点云: {accumulated_predictions_ply}")
         print(f"💡 累积预测: {len(all_centers)} 个检测结果")
     
-    # 保存累积的场景点云
-    if all_pointclouds:
-        print(f"📊 合并并保存累积场景点云...")
-        accumulated_points = np.concatenate([pc['points'] for pc in all_pointclouds], axis=0)
-        accumulated_colors = np.concatenate([pc['colors'] for pc in all_pointclouds], axis=0)
-
-        accumulated_pointcloud_file = os.path.join(accumulated_dir, "accumulated_scene_pointcloud.ply")
-        save_pointcloud_ply(accumulated_points, accumulated_colors, accumulated_pointcloud_file)
-        print(f"💾 保存累积场景点云: {accumulated_pointcloud_file}")
-        print(f"💡 累积点云: {len(accumulated_points):,} 个点")
+    # 注释掉累积场景点云的合并和保存，暂时不需要全场景点云
+    # if all_pointclouds:
+    #     print(f"📊 合并并保存累积场景点云...")
+    #     accumulated_points = np.concatenate([pc['points'] for pc in all_pointclouds], axis=0)
+    #     accumulated_colors = np.concatenate([pc['colors'] for pc in all_pointclouds], axis=0)
+    # 
+    #     accumulated_pointcloud_file = os.path.join(accumulated_dir, "accumulated_scene_pointcloud.ply")
+    #     save_pointcloud_ply(accumulated_points, accumulated_colors, accumulated_pointcloud_file)
+    #     print(f"💾 保存累积场景点云: {accumulated_pointcloud_file}")
+    #     print(f"💡 累积点云: {len(accumulated_points):,} 个点")
+    print("🚀 跳过全场景累积点云处理（专注于物体级处理）")
     # ⭐ 修改：保存每个instance的累积点云（适应新数据结构）
     if instance_pointclouds:
         '''
@@ -248,6 +257,7 @@ def process_data_and_save_outputs(model, dataset, augmentor, preprocessor, score
         
         # 新增：保存归一化的instance点云
         '''
+        # 使用默认体素下采样设置
         save_normalized_instance_pointclouds(instance_pointclouds, output_dir)
     
     # 数据处理完成后的提示
@@ -418,16 +428,17 @@ def process_data_visualization_only(dataset, output_dir="outputs_viz"):
                         instance_pointclouds
                     )
     
-    # 保存累积的场景点云
-    if all_pointclouds:
-        print(f"📊 合并并保存累积场景点云...")
-        accumulated_points = np.concatenate([pc['points'] for pc in all_pointclouds], axis=0)
-        accumulated_colors = np.concatenate([pc['colors'] for pc in all_pointclouds], axis=0)
-
-        accumulated_pointcloud_file = os.path.join(accumulated_dir, "accumulated_scene_pointcloud.ply")
-        save_pointcloud_ply(accumulated_points, accumulated_colors, accumulated_pointcloud_file)
-        print(f"💾 保存累积场景点云: {accumulated_pointcloud_file}")
-        print(f"💡 累积点云: {len(accumulated_points):,} 个点")
+    # 注释掉累积场景点云的合并和保存，暂时不需要全场景点云
+    # if all_pointclouds:
+    #     print(f"📊 合并并保存累积场景点云...")
+    #     accumulated_points = np.concatenate([pc['points'] for pc in all_pointclouds], axis=0)
+    #     accumulated_colors = np.concatenate([pc['colors'] for pc in all_pointclouds], axis=0)
+    # 
+    #     accumulated_pointcloud_file = os.path.join(accumulated_dir, "accumulated_scene_pointcloud.ply")
+    #     save_pointcloud_ply(accumulated_points, accumulated_colors, accumulated_pointcloud_file)
+    #     print(f"💾 保存累积场景点云: {accumulated_pointcloud_file}")
+    #     print(f"💡 累积点云: {len(accumulated_points):,} 个点")
+    print("🚀 跳过全场景累积点云处理（专注于物体级处理）")
 
     if instance_pointclouds:
         '''
@@ -448,6 +459,7 @@ def process_data_visualization_only(dataset, output_dir="outputs_viz"):
 
         print(f"✅ 总共保存了 {len(instance_pointclouds)} 个instance的累积点云")
     '''
+        # 使用默认体素下采样设置
         save_normalized_instance_pointclouds(instance_pointclouds, output_dir)
 
     # 数据处理完成后的提示
@@ -565,12 +577,44 @@ def collect_instance_pointclouds(points_3d, colors, gt_instances, frame_num, ins
             print(f"Collected {point_count} points for instance {instance_id} in frame {frame_num}")
             print(f"  Instance {instance_id} now has {len(instance_pointclouds[instance_id]['pointcloud_frames'])} frames")
 
-def save_normalized_instance_pointclouds(instance_pointclouds, output_dir):
-    """使用统一参考bbox归一化并保存instance点云"""
+def downsample_pointcloud_with_open3d(points, colors, voxel_size=0.004):
+    """使用Open3D进行体素下采样"""
+    if not OPEN3D_AVAILABLE:
+        print(f"⚠️ Open3D不可用，跳过下采样，保留原始 {len(points):,} 个点")
+        return points, colors
+        
+    try:
+        # 创建Open3D点云对象
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        
+        # 体素下采样
+        original_count = len(pcd.points)
+        downsampled_pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+        downsampled_count = len(downsampled_pcd.points)
+        
+        # 转换回numpy数组
+        downsampled_points = np.asarray(downsampled_pcd.points)
+        downsampled_colors = np.asarray(downsampled_pcd.colors)
+        
+        reduction_ratio = (original_count - downsampled_count) / original_count * 100
+        print(f"📦 体素下采样: {original_count:,} -> {downsampled_count:,} 点 "
+              f"(减少 {reduction_ratio:.1f}%, 体素大小: {voxel_size}m)")
+        
+        return downsampled_points, downsampled_colors
+        
+    except Exception as e:
+        print(f"❌ Open3D下采样失败: {e}")
+        print(f"🔄 回退到原始点云: {len(points):,} 个点")
+        return points, colors
+
+def save_normalized_instance_pointclouds(instance_pointclouds, output_dir, voxel_sizes=[0.004, 0.01]):
+    """使用统一参考bbox归一化并保存instance点云，支持多级下采样"""
     normalized_dir = os.path.join(output_dir, "normalized_instances")
     os.makedirs(normalized_dir, exist_ok=True)
     
-    print(f"📊 使用统一参考bbox归一化并保存instance点云...")
+    print(f"📊 使用统一参考bbox归一化并保存instance点云，带体素下采样...")
     
     for instance_id, instance_data in instance_pointclouds.items():
         if not instance_data or 'pointcloud_frames' not in instance_data:
@@ -595,6 +639,7 @@ def save_normalized_instance_pointclouds(instance_pointclouds, output_dir):
         all_colors = []
         frame_info = []
         
+        # 归一化处理
         for frame_data in pointcloud_frames:
             frame_points = frame_data['points']
             frame_colors = frame_data['colors']
@@ -620,20 +665,50 @@ def save_normalized_instance_pointclouds(instance_pointclouds, output_dir):
                   f"X[{normalized_points[:, 0].min():.3f}, {normalized_points[:, 0].max():.3f}]")
         
         if all_normalized_points:
+            # 合并所有归一化点云
             final_normalized_points = np.concatenate(all_normalized_points, axis=0)
             final_colors = np.concatenate(all_colors, axis=0)
             
-            normalized_file = os.path.join(normalized_dir, f"instance_{instance_id}_normalized.ply")
-            save_pointcloud_ply(final_normalized_points, final_colors, normalized_file)
-            print(f"💾 保存instance {instance_id}归一化点云: {normalized_file}")
-            print(f"💡 Instance {instance_id} 归一化点云: {len(final_normalized_points):,} 个点，来自 {len(pointcloud_frames)} 帧")
+            print(f"📦 合并后总点数: {len(final_normalized_points):,} 个点")
             
+            # 对合并后的点云进行多级下采样（如果启用）
+            if voxel_sizes:
+                for voxel_size in voxel_sizes:
+                    # 下采样
+                    downsampled_points, downsampled_colors = downsample_pointcloud_with_open3d(
+                        final_normalized_points, final_colors, voxel_size)
+                    
+                    # 保存下采样后的点云
+                    if voxel_size == voxel_sizes[0]:  # 主文件使用最细的体素
+                        normalized_file = os.path.join(normalized_dir, f"instance_{instance_id}_normalized.ply")
+                    else:
+                        normalized_file = os.path.join(normalized_dir, f"instance_{instance_id}_normalized_voxel_{voxel_size}.ply")
+                    
+                    save_pointcloud_ply(downsampled_points, downsampled_colors, normalized_file)
+                    print(f"💾 保存instance {instance_id}归一化点云 (体素{voxel_size}): {normalized_file}")
+            else:
+                # 不进行下采样，直接保存原始点云
+                normalized_file = os.path.join(normalized_dir, f"instance_{instance_id}_normalized.ply")
+                save_pointcloud_ply(final_normalized_points, final_colors, normalized_file)
+                print(f"💾 保存instance {instance_id}归一化点云 (原始): {normalized_file}")
+            
+            # 保存统计信息
             stats_file = os.path.join(normalized_dir, f"instance_{instance_id}_normalized_stats.txt")
             with open(stats_file, 'w') as f:
                 f.write(f"Instance ID: {instance_id}\n")
                 f.write(f"Total frames: {len(pointcloud_frames)}\n")
-                f.write(f"Total normalized points: {len(final_normalized_points):,}\n")
-                f.write(f"Final normalized points range:\n")
+                f.write(f"Original merged points: {len(final_normalized_points):,}\n")
+                
+                if voxel_sizes:
+                    f.write(f"\nDownsampling results:\n")
+                    for voxel_size in voxel_sizes:
+                        ds_points, ds_colors = downsample_pointcloud_with_open3d(
+                            final_normalized_points, final_colors, voxel_size)
+                        f.write(f"  Voxel {voxel_size}m: {len(ds_points):,} points\n")
+                else:
+                    f.write(f"\nNo downsampling applied.\n")
+                
+                f.write(f"\nFinal normalized points range (original):\n")
                 f.write(f"  X: [{final_normalized_points[:, 0].min():.6f}, {final_normalized_points[:, 0].max():.6f}]\n")
                 f.write(f"  Y: [{final_normalized_points[:, 1].min():.6f}, {final_normalized_points[:, 1].max():.6f}]\n")
                 f.write(f"  Z: [{final_normalized_points[:, 2].min():.6f}, {final_normalized_points[:, 2].max():.6f}]\n")
@@ -652,7 +727,11 @@ def save_normalized_instance_pointclouds(instance_pointclouds, output_dir):
             
             print(f"📊 保存统计信息: {stats_file}")
 
-    print(f"✅ 总共保存了 {len(instance_pointclouds)} 个instance的归一化点云")
+    if voxel_sizes:
+        print(f"✅ 总共保存了 {len(instance_pointclouds)} 个instance的归一化点云（含多级下采样）")
+        print(f"📦 体素下采样级别: {voxel_sizes}")
+    else:
+        print(f"✅ 总共保存了 {len(instance_pointclouds)} 个instance的归一化点云（无下采样）")
     print(f"📁 归一化点云目录: {normalized_dir}")
     print(f"🎯 所有归一化都使用各自instance的第一帧bbox作为统一参考")
 
@@ -849,6 +928,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu", help="Which device to push the model to (cpu, mps, cuda)")
     parser.add_argument("--video-ids", nargs="+", help="Subset of videos to execute on. By default, all. Ignored if a tar file is explicitly given or in stream mode.")
     parser.add_argument("--output-dir", default=None, help="Output directory path (default: auto-generated)")
+    parser.add_argument("--voxel-sizes", nargs="+", type=float, default=[0.004, 0.01], help="体素下采样尺寸列表 (默认: 0.004 0.01)")
+    parser.add_argument("--disable-downsampling", default=False, action="store_true", help="禁用体素下采样")
 
     args = parser.parse_args()
     print("Command Line Args:", args)
