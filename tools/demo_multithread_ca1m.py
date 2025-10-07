@@ -175,6 +175,13 @@ class ThreadSafeWriter:
             nocs_image_pil = Image.fromarray(nocs_image)
             nocs_image_pil.save(filename)
 
+
+def to_object_array(obj):
+    """将任意Python对象包装为0维object数组，便于np.savez存储"""
+    wrapper = np.empty((), dtype=object)
+    wrapper[()] = obj
+    return wrapper
+
 def extract_bbox_info_from_instances(gt_instances):
     """从gt_instances中提取bbox信息"""
     if not gt_instances.has("gt_boxes_3d") or not gt_instances.has("gt_ids"):
@@ -404,28 +411,17 @@ def save_normalized_instance_pointcloud_threaded(instance_id, instance_data, out
         save_pointcloud_task(result, output_dir)
 
 def generate_nocs_image_threaded(frame_data, writer):
-    """多线程生成NOCS图像"""
-    xyzrgb, world_gt_instances, depth_shape, pixel_coords_valid, frame_count, nocs_dir = frame_data
-    
-    if world_gt_instances is None or len(world_gt_instances) == 0:
-        return
-    
-    # 生成NOCS图
-    nocs_image = generate_instance_nocs_map(
-        xyzrgb[..., :3],
-        world_gt_instances,
-        None, None,  # 不使用相机参数
-        depth_shape,
-        pixel_coords=pixel_coords_valid
-    )
-    
-    # 保存NOCS图像
-    if nocs_image is not None:
-        nocs_file = os.path.join(nocs_dir, f"frame_{frame_count:04d}_nocs.png")
-        writer.write_nocs_image(nocs_image, nocs_file)
-        print(f"💾 [线程] 保存NOCS图: {nocs_file}")
+    """多线程保存预计算的NOCS图像"""
+    nocs_image, nocs_dir, frame_count = frame_data
 
-def generate_instance_nocs_map(points_3d, gt_instances, camera_K, camera_RT, image_shape, pixel_coords=None):
+    if nocs_image is None:
+        return
+
+    nocs_file = os.path.join(nocs_dir, f"frame_{frame_count:04d}_nocs.png")
+    writer.write_nocs_image(nocs_image, nocs_file)
+    print(f"💾 [线程] 保存NOCS图: {nocs_file}")
+
+def generate_instance_nocs_map(points_3d, gt_instances, camera_K, camera_RT, image_shape, pixel_coords=None, return_aux=False):
     """为每帧中检测到的所有物体生成NOCS图"""
     if gt_instances is None or len(gt_instances) == 0:
         return None
@@ -458,14 +454,24 @@ def generate_instance_nocs_map(points_3d, gt_instances, camera_K, camera_RT, ima
         return None
     
     points_3d_valid = points_3d_reshaped[valid_mask]
-    pixel_u_valid = pixel_u[valid_mask]
-    pixel_v_valid = pixel_v[valid_mask]
+    pixel_u_valid = pixel_u[valid_mask].astype(np.int32)
+    pixel_v_valid = pixel_v[valid_mask].astype(np.int32)
     
     if len(points_3d_valid) == 0:
         print("⚠️ 没有有效的3D点")
         return None
     
     nocs_image = np.zeros((height, width, 3), dtype=np.float32)
+
+    aux_data = None
+    if return_aux:
+        segmentation = np.full((height, width), 255, dtype=np.uint8)
+        instance_masks = []
+        instance_ids = []
+        raw_instance_ids = []
+        pose_mats = []
+        bbox_entries = []
+        instance_names = []
     
     if gt_instances.has("gt_boxes_3d"):
         boxes_3d = gt_instances.get("gt_boxes_3d")
@@ -478,31 +484,96 @@ def generate_instance_nocs_map(points_3d, gt_instances, camera_K, camera_RT, ima
     centers = boxes_3d.gravity_center.cpu().numpy()
     dims = boxes_3d.dims.cpu().numpy()
     
+    box_ids = gt_instances.get("gt_ids") if gt_instances.has("gt_ids") else [i for i in range(len(boxes_3d))]
+    box_names = gt_instances.get("gt_names") if gt_instances.has("gt_names") else None
+
     for i in range(len(boxes_3d)):
         box_corners = corners[i]
         box_rotation = rotations[i]
         box_center = centers[i]
         box_dims = dims[i]
-        
+
         in_box_mask = points_in_box(points_3d_valid, box_corners)
-        
+
         point_count = np.sum(in_box_mask)
-        
+
         if point_count > 0:
             instance_points = points_3d_valid[in_box_mask]
             instance_u = pixel_u_valid[in_box_mask]
             instance_v = pixel_v_valid[in_box_mask]
-            
+
             nocs_points, nocs_colors = compute_nocs_with_bbox_orientation(
                 instance_points, box_center, box_rotation, box_dims, i)
-            
+
             nocs_image[instance_v, instance_u] = nocs_colors
-    
+
+            if return_aux:
+                raw_id = box_ids[i]
+                try:
+                    numeric_id = int(raw_id)
+                except (TypeError, ValueError):
+                    numeric_id = int(i + 1)
+
+                mask = np.zeros((height, width), dtype=np.uint8)
+                mask[instance_v, instance_u] = 1
+
+                segmentation[instance_v, instance_u] = numeric_id
+                instance_masks.append(mask)
+                instance_ids.append(numeric_id)
+                raw_instance_ids.append(str(raw_id))
+
+                pose_mat = np.eye(4, dtype=np.float32)
+                pose_mat[:3, :3] = box_rotation.astype(np.float32)
+                pose_mat[:3, 3] = box_center.astype(np.float32)
+                pose_mats.append(pose_mat)
+
+                bbox_entries.append({
+                    'instance_id': numeric_id,
+                    'bbox': {
+                        'x': float(box_center[0]),
+                        'y': float(box_center[1]),
+                        'z': float(box_center[2]),
+                        'w': float(box_dims[0]),
+                        'h': float(box_dims[1]),
+                        'l': float(box_dims[2]),
+                        'R': box_rotation.astype(np.float32)
+                    }
+                })
+
+                if box_names is not None and len(box_names) > i:
+                    instance_names.append(str(box_names[i]))
+                else:
+                    instance_names.append(str(raw_id))
+
     if np.any(nocs_image > 0):
         nocs_image_display = (np.clip(nocs_image, 0, 1) * 255).astype(np.uint8)
-        return nocs_image_display
     else:
-        return None
+        nocs_image_display = None
+
+    if return_aux:
+        if instance_masks:
+            masks_array = np.stack(instance_masks, axis=0)
+        else:
+            masks_array = np.zeros((0, height, width), dtype=np.uint8)
+
+        if pose_mats:
+            poses_array = np.stack(pose_mats, axis=0)
+        else:
+            poses_array = np.zeros((0, 4, 4), dtype=np.float32)
+
+        aux_data = {
+            'segmentation': segmentation,
+            'instance_masks': masks_array,
+            'instance_ids': np.array(instance_ids, dtype=np.int32),
+            'raw_instance_ids': np.array(raw_instance_ids, dtype=object),
+            'poses': poses_array,
+            'bbox': bbox_entries,
+            'instance_names': np.array(instance_names, dtype=object)
+        }
+
+        return nocs_image_display, aux_data
+    else:
+        return nocs_image_display
 
 def compute_nocs_with_bbox_orientation(points, box_center, box_rotation, box_dims, instance_id):
     """使用bbox的完整信息计算NOCS变换"""
@@ -570,7 +641,7 @@ def process_single_scene(scene_path, output_base_dir, voxel_size=0.004, compute_
     # 初始化耗时统计
     timing_stats = TimingStats()
     timing_stats.start_total_timer()
-    
+
     # 创建数据集
     dataset = CubifyAnythingDataset(
         [Path(scene_path).as_uri()],
@@ -583,7 +654,21 @@ def process_single_scene(scene_path, output_base_dir, voxel_size=0.004, compute_
     instance_pointclouds = {}
     scene_bbox_info = {}
     writer = ThreadSafeWriter()
-    
+
+    # 场景级缓存，便于生成NPZ
+    scene_colors = []
+    scene_points = []
+    scene_depths = []
+    extrinsics_list = []
+    intrinsics_list = []
+    nocs_maps = []
+    segmentation_list = []
+    scene_instance_ids = {}
+    scene_poses = {}
+    bbox_dict = {}
+    model_names_set = set()
+    model_dims = defaultdict(list)
+
     # 收集NOCS生成任务
     nocs_tasks = []
     
@@ -607,23 +692,39 @@ def process_single_scene(scene_path, output_base_dir, voxel_size=0.004, compute_
         if "gt" in sample and sample["gt"] is not None and "depth" in sample["gt"]:
             timing_stats.start_timer('depth_unprojection')
             depth_gt = sample["gt"]["depth"][-1]
-            matched_image = torch.tensor(np.array(Image.fromarray(image).resize((depth_gt.shape[1], depth_gt.shape[0]))))
-            
+            height, width = depth_gt.shape[-2:]
+            matched_image_np = np.array(Image.fromarray(image).resize((width, height)))
+            matched_image = torch.tensor(matched_image_np)
+
             RT_camera_to_world = sample["sensor_info"].gt.RT[-1]
             xyz, valid = unproject(depth_gt, sample["sensor_info"].gt.depth.K[-1], RT_camera_to_world, max_depth=10.0)
             xyzrgb = torch.cat((xyz, matched_image / 255.0), dim=-1)[valid]
-            
-            height, width = depth_gt.shape[-2:]
-            v_coords, u_coords = torch.meshgrid(torch.arange(height), torch.arange(width), indexing='ij')
-            pixel_coords = torch.stack([u_coords, v_coords], dim=-1)
-            pixel_coords_valid = pixel_coords[valid]
             timing_stats.end_timer('depth_unprojection')
-            
+
+            depth_np = depth_gt.cpu().numpy().astype(np.float32)
+            xyz_np = xyz.cpu().numpy().astype(np.float32)
+            extrinsic_world_to_camera = np.linalg.inv(RT_camera_to_world.cpu().numpy()).astype(np.float32)
+            intrinsic_np = sample["sensor_info"].gt.depth.K[-1].cpu().numpy().astype(np.float32)
+
+            scene_colors.append(matched_image_np.astype(np.uint8))
+            scene_depths.append(depth_np)
+            scene_points.append(xyz_np)
+            extrinsics_list.append(extrinsic_world_to_camera)
+            intrinsics_list.append(intrinsic_np)
+
+            frame_idx = frame_count - 1
+            frame_key = f"{frame_idx:04d}"
+            frame_segmentation = np.full((height, width), 255, dtype=np.uint8)
+            frame_nocs = np.full((height, width, 3), 255, dtype=np.uint8)
+            frame_instance_ids = np.zeros((0,), dtype=np.int32)
+            frame_poses = np.zeros((0, 4, 4), dtype=np.float32)
+            frame_bbox = {}
+
+            world_gt_instances = None
             if len(xyzrgb) > 0:
                 # GT实例处理
                 timing_stats.start_timer('gt_instance_processing')
-                world_gt_instances = None
-                
+
                 if "world_instances_3d" in sample and sample["world_instances_3d"] is not None:
                     world_gt_instances = sample["world_instances_3d"]
                 elif "world" in sample and "instances" in sample["world"]:
@@ -631,50 +732,128 @@ def process_single_scene(scene_path, output_base_dir, voxel_size=0.004, compute_
                 elif "wide" in sample and "instances" in sample["wide"]:
                     gt_instances = sample["wide"]["instances"]
                     world_gt_instances = gt_instances.clone()
-                    
+
                     if world_gt_instances.has("gt_boxes_3d"):
                         original_boxes = world_gt_instances.get("gt_boxes_3d")
                         RT_np = RT_camera_to_world.numpy()
-                        
+
                         centers = original_boxes.gravity_center.cpu().numpy()
                         centers_homogeneous = np.concatenate([centers, np.ones((centers.shape[0], 1))], axis=1)
                         transformed_centers = (RT_np @ centers_homogeneous.T).T[:, :3]
-                        
+
                         transformed_R = RT_np[:3, :3] @ original_boxes.R.cpu().numpy()
                         transformed_boxes = GeneralInstance3DBoxes(
                             np.concatenate([transformed_centers, original_boxes.dims.cpu().numpy()], axis=1),
                             transformed_R
                         )
-                        
+
                         world_gt_instances.set("gt_boxes_3d", transformed_boxes)
-                
+
                 timing_stats.end_timer('gt_instance_processing')
-                
-                if world_gt_instances is not None and len(world_gt_instances) > 0:
-                    # 收集bbox信息（仅第一帧）
-                    if frame_count == 1:
-                        scene_bbox_info = extract_bbox_info_from_instances(world_gt_instances)
-                    
-                    # 添加NOCS生成任务
-                    nocs_tasks.append((
-                        xyzrgb.cpu().numpy(),
-                        world_gt_instances,
-                        depth_gt.shape[-2:],
-                        pixel_coords_valid.cpu().numpy(),
-                        frame_count,
-                        nocs_dir
-                    ))
-                    
-                    # 实例点云收集
-                    timing_stats.start_timer('instance_pointcloud_collection')
-                    collect_instance_pointclouds(
-                        xyzrgb[..., :3].cpu().numpy(),
-                        xyzrgb[..., 3:].cpu().numpy(),
-                        world_gt_instances,
-                        frame_count,
-                        instance_pointclouds
-                    )
-                    timing_stats.end_timer('instance_pointcloud_collection')
+
+            if world_gt_instances is not None and len(world_gt_instances) > 0:
+                # 收集bbox信息（仅第一帧）
+                if frame_count == 1:
+                    scene_bbox_info = extract_bbox_info_from_instances(world_gt_instances)
+
+                boxes = world_gt_instances.get("gt_boxes_3d") if world_gt_instances.has("gt_boxes_3d") else None
+                names = world_gt_instances.get("gt_names") if world_gt_instances.has("gt_names") else []
+                if boxes is not None:
+                    dims_np = boxes.dims.cpu().numpy()
+                    for name, dims in zip(names, dims_np):
+                        model_names_set.add(str(name))
+                        model_dims[str(name)].append(np.array(dims, dtype=np.float32))
+
+                nocs_result = generate_instance_nocs_map(
+                    xyz_np,
+                    world_gt_instances,
+                    intrinsic_np,
+                    RT_camera_to_world.cpu().numpy(),
+                    depth_gt.shape[-2:],
+                    return_aux=True
+                )
+
+                if nocs_result is not None:
+                    nocs_image, aux_data = nocs_result
+                    if nocs_image is not None:
+                        frame_nocs = nocs_image.astype(np.uint8)
+                    if aux_data is not None:
+                        frame_segmentation = aux_data.get('segmentation', frame_segmentation)
+                        frame_instance_ids = aux_data.get('instance_ids', frame_instance_ids).astype(np.int32)
+                        frame_poses = aux_data.get('poses', frame_poses).astype(np.float32)
+
+                        bbox_entries = aux_data.get('bbox', [])
+                        for entry in bbox_entries:
+                            instance_id = int(entry['instance_id'])
+                            frame_bbox[instance_id] = entry['bbox']
+
+                        instance_names = aux_data.get('instance_names', [])
+                        for name in instance_names:
+                            model_names_set.add(str(name))
+
+                raw_ids = world_gt_instances.get("gt_ids") if world_gt_instances.has("gt_ids") else []
+                if frame_instance_ids.size == 0 and raw_ids:
+                    fallback_ids = []
+                    for idx, raw_id in enumerate(raw_ids):
+                        try:
+                            fallback_ids.append(int(raw_id))
+                        except (TypeError, ValueError):
+                            fallback_ids.append(idx + 1)
+                    frame_instance_ids = np.array(fallback_ids, dtype=np.int32)
+
+                if frame_poses.shape[0] == 0 and boxes is not None and len(boxes) > 0:
+                    pose_list = []
+                    centers_np = boxes.gravity_center.cpu().numpy()
+                    rotations_np = boxes.R.cpu().numpy()
+                    for center, rotation in zip(centers_np, rotations_np):
+                        pose = np.eye(4, dtype=np.float32)
+                        pose[:3, :3] = rotation.astype(np.float32)
+                        pose[:3, 3] = center.astype(np.float32)
+                        pose_list.append(pose)
+                    if pose_list:
+                        frame_poses = np.stack(pose_list, axis=0)
+
+                if not frame_bbox and boxes is not None and len(boxes) > 0:
+                    centers_np = boxes.gravity_center.cpu().numpy()
+                    dims_np = boxes.dims.cpu().numpy()
+                    rotations_np = boxes.R.cpu().numpy()
+                    for idx, (center, dims, rotation) in enumerate(zip(centers_np, dims_np, rotations_np)):
+                        instance_id = int(frame_instance_ids[idx]) if idx < len(frame_instance_ids) else idx
+                        frame_bbox[instance_id] = {
+                            'x': float(center[0]),
+                            'y': float(center[1]),
+                            'z': float(center[2]),
+                            'w': float(dims[0]),
+                            'h': float(dims[1]),
+                            'l': float(dims[2]),
+                            'R': rotation.astype(np.float32)
+                        }
+
+                # 实例点云收集
+                timing_stats.start_timer('instance_pointcloud_collection')
+                collect_instance_pointclouds(
+                    xyzrgb[..., :3].cpu().numpy(),
+                    xyzrgb[..., 3:].cpu().numpy(),
+                    world_gt_instances,
+                    frame_count,
+                    instance_pointclouds
+                )
+                timing_stats.end_timer('instance_pointcloud_collection')
+
+            # 填充背景为255，保持一致格式
+            if frame_segmentation is not None:
+                background_mask = frame_segmentation == 255
+                frame_nocs = frame_nocs.copy()
+                frame_nocs[background_mask] = 255
+
+            nocs_maps.append(frame_nocs)
+            segmentation_list.append(frame_segmentation)
+            scene_instance_ids[frame_key] = frame_instance_ids.astype(np.int32)
+            scene_poses[frame_key] = frame_poses.astype(np.float32)
+            bbox_dict[frame_key] = frame_bbox
+
+            # 添加NOCS生成任务用于异步写盘
+            nocs_tasks.append((frame_nocs, nocs_dir, frame_idx))
         
         # 记录单帧处理时间
         frame_time = time.time() - frame_start_time
@@ -734,7 +913,96 @@ def process_single_scene(scene_path, output_base_dir, voxel_size=0.004, compute_
                 except Exception as e:
                     print(f"❌ 点云保存失败: {e}")
         timing_stats.end_timer('pointcloud_io')
-    
+
+    # 汇总并保存场景数据为NPZ
+    scene_npz_path = os.path.join(scene_output_dir, f"{scene_name}.npz")
+
+    if scene_colors:
+        scene_colors_np = np.stack(scene_colors, axis=0).astype(np.uint8)
+    else:
+        scene_colors_np = np.zeros((0, 0, 0, 3), dtype=np.uint8)
+
+    if scene_points:
+        scene_points_np = np.stack(scene_points, axis=0).astype(np.float32)
+    else:
+        scene_points_np = np.zeros((0, 0, 0, 3), dtype=np.float32)
+
+    if scene_depths:
+        scene_depths_np = np.stack(scene_depths, axis=0).astype(np.float32)
+    else:
+        scene_depths_np = np.zeros((0, 0, 0), dtype=np.float32)
+
+    if extrinsics_list:
+        extrinsics_np = np.stack(extrinsics_list, axis=0).astype(np.float32)
+    else:
+        extrinsics_np = np.zeros((0, 4, 4), dtype=np.float32)
+
+    if intrinsics_list:
+        intrinsics_np = np.stack(intrinsics_list, axis=0).astype(np.float32)
+    else:
+        intrinsics_np = np.zeros((0, 3, 3), dtype=np.float32)
+
+    if nocs_maps:
+        nocs_maps_np = np.stack(nocs_maps, axis=0).astype(np.uint8)
+    else:
+        nocs_maps_np = np.zeros((0, 0, 0, 3), dtype=np.uint8)
+
+    if segmentation_list:
+        masks_np = np.stack(segmentation_list, axis=0).astype(np.uint8)
+    else:
+        masks_np = np.zeros((0, 0, 0), dtype=np.uint8)
+
+    model_list_sorted = sorted(model_names_set)
+    if model_list_sorted:
+        scene_scales_np = np.zeros((len(model_list_sorted), 3), dtype=np.float32)
+        for idx, name in enumerate(model_list_sorted):
+            dims_list = model_dims.get(name, [])
+            if dims_list:
+                scene_scales_np[idx] = np.mean(np.stack(dims_list, axis=0), axis=0).astype(np.float32)
+            else:
+                scene_scales_np[idx] = 0.0
+        model_list_np = np.array(model_list_sorted, dtype=object)
+    else:
+        scene_scales_np = np.zeros((0, 3), dtype=np.float32)
+        model_list_np = np.array([], dtype=object)
+
+    scene_instance_ids_dict = {key: np.asarray(val, dtype=np.int32) for key, val in scene_instance_ids.items()}
+    scene_poses_dict = {key: np.asarray(val, dtype=np.float32) for key, val in scene_poses.items()}
+    bbox_serializable = {}
+    for key, bbox_per_frame in bbox_dict.items():
+        bbox_serializable[key] = {}
+        for instance_id, bbox_entry in bbox_per_frame.items():
+            bbox_serializable[key][int(instance_id)] = {
+                'x': float(bbox_entry['x']),
+                'y': float(bbox_entry['y']),
+                'z': float(bbox_entry['z']),
+                'w': float(bbox_entry['w']),
+                'h': float(bbox_entry['h']),
+                'l': float(bbox_entry['l']),
+                'R': np.asarray(bbox_entry['R'], dtype=np.float32)
+            }
+
+    scene_data = dict(
+        scene_colors=scene_colors_np,
+        scene_points=scene_points_np,
+        scene_depths=scene_depths_np,
+        extrinsics=extrinsics_np,
+        intrinsics=intrinsics_np,
+        scene_scales=scene_scales_np,
+        scene_poses=to_object_array(scene_poses_dict),
+        masks=masks_np,
+        nocs_maps=nocs_maps_np,
+        scene_instance_ids=to_object_array(scene_instance_ids_dict),
+        model_list=model_list_np,
+        bbox=to_object_array(bbox_serializable)
+    )
+
+    try:
+        np.savez_compressed(scene_npz_path, **scene_data)
+        print(f"💾 保存场景NPZ: {scene_npz_path}")
+    except Exception as exc:
+        print(f"❌ 保存场景NPZ失败: {exc}")
+
     # 保存场景bbox信息
     if scene_bbox_info:
         bbox_file = os.path.join(scene_output_dir, "scene_bbox_info.json")
@@ -749,10 +1017,18 @@ def process_single_scene(scene_path, output_base_dir, voxel_size=0.004, compute_
     print(f"📁 输出目录: {scene_output_dir}")
     if instance_pointclouds:
         print(f"🎯 保存了 {len(instance_pointclouds)} 个归一化实例点云")
-    
+
     # 打印详细的耗时统计
     timing_stats.print_summary()
-    
+
+    # 标记场景处理完成，便于后续运行跳过
+    marker_path = os.path.join(scene_output_dir, "scene_complete.marker")
+    try:
+        with open(marker_path, "w", encoding="utf-8") as marker_file:
+            marker_file.write(datetime.now().isoformat())
+    except OSError as exc:
+        print(f"⚠️ 无法写入标记文件 {marker_path}: {exc}")
+
     return scene_name, total_time, frame_count, len(instance_pointclouds)
 
 def get_scene_files(data_dir, split, worker_id=None, total_workers=None):
@@ -884,10 +1160,20 @@ def main():
     
     print(f"\n🎬 开始多线程处理 {len(scene_files)} 个场景...")
     
+    skipped_scenes = []
+
     with ThreadPoolExecutor(max_workers=args.scene_workers, thread_name_prefix="Scene") as executor:
         # 提交所有场景处理任务
         future_to_scene = {}
         for scene_file in scene_files:
+            scene_name = Path(scene_file).stem
+            marker_path = os.path.join(split_output_dir, scene_name, "scene_complete.marker")
+
+            if os.path.exists(marker_path):
+                skipped_scenes.append(scene_name)
+                print(f"⏭️ 跳过场景 {scene_name}: 检测到标记文件 {marker_path}")
+                continue
+
             future = executor.submit(
                 process_single_scene,
                 scene_file,
@@ -919,6 +1205,7 @@ def main():
     print("="*80)
     print(f"🕒 总处理时间: {total_time:.2f}秒")
     print(f"✅ 成功处理场景: {len(successful_scenes)} 个")
+    print(f"⏭️ 跳过场景: {len(skipped_scenes)} 个")
     print(f"❌ 失败场景: {len(failed_scenes)} 个")
     
     if successful_scenes:
@@ -936,7 +1223,12 @@ def main():
         print("\n❌ 失败场景列表:")
         for scene_name, error in failed_scenes:
             print(f"  - {scene_name}: {error}")
-    
+
+    if skipped_scenes:
+        print("\n⏭️ 跳过场景列表:")
+        for scene_name in skipped_scenes:
+            print(f"  - {scene_name}")
+
     print(f"\n📁 输出目录: {split_output_dir}")
     
     # 分布式处理提示
